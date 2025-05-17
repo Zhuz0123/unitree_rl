@@ -8,7 +8,7 @@ if len(sys.argv) > 1:
     data_path = sys.argv[1]
 else:
     # 假设文件在logs/attitude_history目录下
-    data_path = os.path.join("logs", "attitude_history", "attitude_history_20250420_102537_env4.npy")
+    data_path = os.path.join("logs", "attitude_history", "attitude_history_20250517_164209_env0.npy")
 
 # 检查文件是否存在
 if not os.path.exists(data_path):
