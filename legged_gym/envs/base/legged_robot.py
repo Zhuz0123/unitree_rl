@@ -97,7 +97,18 @@ class LeggedRobot(BaseTask):
         self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
-
+        
+        # # 记录初始高度（如果尚未记录）
+        # if self.common_step_counter == 1:
+        #     self.initial_base_height[:] = self.base_pos[:, 2]
+        
+        # # 记录基座高度
+        # if self.common_step_counter % self.height_recording_freq == 0:
+        #     idx = self.height_history_index % self.height_history_capacity
+        #     self.base_height_history[:, idx] = self.base_pos[:, 2]
+        #     self.height_record_timestamp[:, idx] = self.episode_length_buf * self.dt
+        #     self.height_history_index += 1
+        
         self._post_physics_step_callback()
 
         # compute observations, rewards, resets, ...
@@ -115,14 +126,16 @@ class LeggedRobot(BaseTask):
         self.last_dof_vel[:] = self.dof_vel[:]
         self.last_root_vel[:] = self.root_states[:, 7:13]
 
-        # 计算并记录基座姿态(从投影重力计算俯仰角和滚转角)
+        # 计算并记录基座姿态(使用四元数直接转换为欧拉角)
         if self.common_step_counter % self.attitude_recording_freq == 0:
-            # 从投影重力计算俯仰角和滚转角(弧度)
-            pitch = torch.atan2(self.projected_gravity[:, 0], self.projected_gravity[:, 2])
-            roll = torch.atan2(self.projected_gravity[:, 1], self.projected_gravity[:, 2])
+            # 使用四元数直接转换为欧拉角(roll, pitch, yaw)
+            # self.rpy已经在post_physics_step开始时通过get_euler_xyz_in_tensor计算过了
+            # 直接使用其中的roll和pitch值
+            roll = self.rpy[:, 0]  # x轴旋转 (roll)
+            pitch = self.rpy[:, 1]  # y轴旋转 (pitch)
             
             # 记录到历史缓冲区
-            idx = self.attitude_history_index % 100  # 循环使用缓冲区
+            idx = self.attitude_history_index % 1000  # 循环使用缓冲区
             self.base_attitude_history[:, 0, idx] = pitch  # 俯仰角
             self.base_attitude_history[:, 1, idx] = roll   # 滚转角
             self.attitude_history_index += 1
@@ -154,6 +167,9 @@ class LeggedRobot(BaseTask):
 
         self._resample_commands(env_ids)
 
+        # # 重置环境时也重置高度历史记录
+        # self.height_history_index[env_ids] = 0
+        
         # reset buffers
         self.actions[env_ids] = 0.
         self.last_actions[env_ids] = 0.
@@ -495,9 +511,22 @@ class LeggedRobot(BaseTask):
         self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
 
         # 添加用于记录基座姿态变化的缓冲区
-        self.base_attitude_history = torch.zeros(self.num_envs, 2, 100, device=self.device, requires_grad=False)  # 存储100个时间步的俯仰角和滚转角
+        self.base_attitude_history = torch.zeros(self.num_envs, 2, 1000, device=self.device, requires_grad=False)  # 存储100个时间步的俯仰角和滚转角
         self.attitude_history_index = torch.zeros(self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)  # 当前历史记录的索引
-        self.attitude_recording_freq = 5  # 每5个时间步记录一次
+        self.attitude_recording_freq = 1  # 每1个时间步记录一次
+
+        # # 添加用于记录基座高度变化的缓冲区
+        # self.height_history_capacity = 1000  # 存储1000个时间步的高度数据
+        # self.base_height_history = torch.zeros(self.num_envs, self.height_history_capacity, 
+        #                                      device=self.device, requires_grad=False)
+        # self.height_history_index = torch.zeros(self.num_envs, dtype=torch.long, 
+        #                                       device=self.device, requires_grad=False)
+        # self.height_recording_freq = 1  # 默认每个时间步都记录
+        # self.height_record_timestamp = torch.zeros(self.num_envs, self.height_history_capacity,
+        #                                         device=self.device, requires_grad=False)
+        # # 存储起始和目标高度，用于参考
+        # self.initial_base_height = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+        # self.target_base_height = torch.ones(self.num_envs, device=self.device, requires_grad=False) * self.cfg.rewards.base_height_target
 
     def _prepare_reward_function(self):
         """ Prepares a list of reward functions, whcih will be called to compute the total reward.
@@ -762,21 +791,21 @@ class LeggedRobot(BaseTask):
             path = os.path.join(save_dir, f'attitude_history_{timestamp}_env{env_id}.npy')
         
         # 将数据转换为numpy格式并保存
-        history_length = min(100, self.attitude_history_index[env_id].item())
+        history_length = min(1000, self.attitude_history_index[env_id].item())
         if history_length == 0:
             print(f"No attitude history data available for env {env_id}")
             return
         
         # 获取有效的历史数据并整理为合适的格式
-        if self.attitude_history_index[env_id] <= 100:
+        if self.attitude_history_index[env_id] <= 1000:
             # 如果没有循环使用缓冲区
             attitude_data = self.base_attitude_history[env_id, :, :history_length].cpu().numpy()
         else:
             # 如果已经循环使用了缓冲区，需要重新排序数据
-            idx = self.attitude_history_index[env_id] % 100
-            attitude_data = np.zeros((2, 100))
-            attitude_data[:, :100-idx] = self.base_attitude_history[env_id, :, idx:].cpu().numpy()
-            attitude_data[:, 100-idx:] = self.base_attitude_history[env_id, :, :idx].cpu().numpy()
+            idx = self.attitude_history_index[env_id] % 1000
+            attitude_data = np.zeros((2, 1000))
+            attitude_data[:, :1000-idx] = self.base_attitude_history[env_id, :, idx:].cpu().numpy()
+            attitude_data[:, 1000-idx:] = self.base_attitude_history[env_id, :, :idx].cpu().numpy()
         
         # 转置为更易理解的格式：[time_step, (pitch, roll)]
         attitude_data = attitude_data.T
@@ -796,3 +825,113 @@ class LeggedRobot(BaseTask):
         np.save(path, result)
         print(f"Saved attitude history to {path}")
         return path
+
+    # def get_height_statistics(self, env_id=0):
+    #     """获取特定环境的高度统计信息
+        
+    #     Args:
+    #         env_id (int): 要分析的环境ID
+            
+    #     Returns:
+    #         dict: 包含高度统计信息的字典
+    #     """
+    #     # 确定有效数据的数量
+    #     valid_samples = min(self.height_history_index[env_id].item(), self.height_history_capacity)
+        
+    #     if valid_samples == 0:
+    #         return {"error": "No height data recorded yet"}
+        
+    #     # 获取有效数据
+    #     if self.height_history_index[env_id] < self.height_history_capacity:
+    #         # 如果缓冲区未满
+    #         heights = self.base_height_history[env_id, :valid_samples].cpu()
+    #         timestamps = self.height_record_timestamp[env_id, :valid_samples].cpu()
+    #     else:
+    #         # 如果缓冲区已满并开始循环使用
+    #         idx = self.height_history_index[env_id] % self.height_history_capacity
+    #         heights = torch.cat([
+    #             self.base_height_history[env_id, idx:],
+    #             self.base_height_history[env_id, :idx]
+    #         ]).cpu()
+    #         timestamps = torch.cat([
+    #             self.height_record_timestamp[env_id, idx:],
+    #             self.height_record_timestamp[env_id, :idx]
+    #         ]).cpu()
+        
+    #     # 计算统计信息
+    #     mean_height = torch.mean(heights).item()
+    #     min_height = torch.min(heights).item()
+    #     max_height = torch.max(heights).item()
+    #     std_height = torch.std(heights).item()
+        
+    #     # 计算与目标高度的偏差
+    #     target_height = self.target_base_height[env_id].item()
+    #     mean_deviation = torch.mean(torch.abs(heights - target_height)).item()
+    #     max_deviation = torch.max(torch.abs(heights - target_height)).item()
+        
+    #     return {
+    #         "initial_height": self.initial_base_height[env_id].item(),
+    #         "target_height": target_height,
+    #         "mean_height": mean_height,
+    #         "min_height": min_height,
+    #         "max_height": max_height,
+    #         "std_height": std_height,
+    #         "mean_deviation_from_target": mean_deviation,
+    #         "max_deviation_from_target": max_deviation,
+    #         "num_samples": valid_samples
+    #     }
+
+    # def save_height_history(self, env_id=0, path=None):
+    #     """保存特定环境的高度历史记录到文件
+        
+    #     Args:
+    #         env_id (int): 要保存的环境ID
+    #         path (str): 保存路径，如果为None则使用默认路径
+            
+    #     Returns:
+    #         str: 保存文件的路径
+    #     """
+    #     import numpy as np
+    #     import os
+    #     from datetime import datetime
+        
+    #     if path is None:
+    #         # 创建默认保存路径
+    #         save_dir = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', 'height_history')
+    #         os.makedirs(save_dir, exist_ok=True)
+    #         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    #         path = os.path.join(save_dir, f'height_history_{timestamp}_env{env_id}.npy')
+        
+    #     # 确定有效数据的数量
+    #     valid_samples = min(self.height_history_index[env_id].item(), self.height_history_capacity)
+        
+    #     if valid_samples == 0:
+    #         print(f"No height data recorded for env {env_id}")
+    #         return None
+        
+    #     # 获取有效数据
+    #     if self.height_history_index[env_id] < self.height_history_capacity:
+    #         # 如果缓冲区未满
+    #         heights = self.base_height_history[env_id, :valid_samples].cpu().numpy()
+    #         timestamps = self.height_record_timestamp[env_id, :valid_samples].cpu().numpy()
+    #     else:
+    #         # 如果缓冲区已满并开始循环使用
+    #         idx = self.height_history_index[env_id] % self.height_history_capacity
+    #         heights = torch.cat([
+    #             self.base_height_history[env_id, idx:],
+    #             self.base_height_history[env_id, :idx]
+    #         ]).cpu().numpy()
+    #         timestamps = torch.cat([
+    #             self.height_record_timestamp[env_id, idx:],
+    #             self.height_record_timestamp[env_id, :idx]
+    #         ]).cpu().numpy()
+        
+    #     # 创建结构化数组
+    #     result = np.zeros(valid_samples, dtype=[('time', 'f4'), ('height', 'f4')])
+    #     result['time'] = timestamps
+    #     result['height'] = heights
+        
+    #     # 保存数据
+    #     np.save(path, result)
+    #     print(f"Saved height history to {path}")
+    #     return path
